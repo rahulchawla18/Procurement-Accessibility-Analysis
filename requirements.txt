@@ -1,0 +1,25 @@
+# Requirements file for Procurement Accessibility Analysis
+# This file is provided for compatibility. The project uses uv (pyproject.toml) as the primary package manager.
+
+# Core dependencies
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.0
+
+# Data processing
+pandas==2.1.3
+numpy==1.26.2
+
+# Testing
+pytest==7.4.3
+httpx==0.25.2
+requests==2.31.0
+
+# Optional: for more advanced NLP
+# transformers==4.35.2
+# torch==2.1.1
+
+# Code quality (optional)
+# black==23.11.0
+# flake8==6.1.0
+
