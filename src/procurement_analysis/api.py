@@ -2,11 +2,32 @@
 FastAPI Application for Procurement Barrier Analysis
 """
 
+import os
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load .env file from project root
+    project_root = Path(__file__).parent.parent.parent
+    env_path = project_root / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+    else:
+        # Try loading from current directory as fallback
+        load_dotenv()
+except ImportError:
+    # python-dotenv not installed, skip loading .env file
+    pass
+
 from .barrier_detector import BarrierDetector
+
+# Configuration from environment variables
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 
 # Request models
@@ -72,18 +93,23 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Initialize barrier detector
-detector = BarrierDetector()
+# Initialize barrier detector (RAG-based only)
+detector = BarrierDetector(
+    groq_api_key=GROQ_API_KEY,
+    groq_model=GROQ_MODEL
+)
 
 
 # Health check endpoint
 @app.get("/")
 def read_root():
     """Health check endpoint."""
+    detector_type = "RAG-based (Groq)"
     return {
         "message": "Procurement Barrier Analysis API",
         "status": "running",
         "version": "1.0.0",
+        "detector_type": detector_type,
         "endpoints": {
             "POST /analyze_tender": "Analyze a single tender document for barriers",
             "POST /analyze_batch": "Analyze multiple tender documents at once",

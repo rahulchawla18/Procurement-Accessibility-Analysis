@@ -15,9 +15,11 @@ pytest==7.4.3
 httpx==0.25.2
 requests==2.31.0
 
-# Optional: for more advanced NLP
-# transformers==4.35.2
-# torch==2.1.1
+# RAG dependencies
+groq>=0.4.0
+
+# Environment variables
+python-dotenv>=1.0.0
 
 # Code quality (optional)
 # black==23.11.0

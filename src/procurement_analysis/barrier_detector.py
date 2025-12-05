@@ -1,13 +1,41 @@
 """
-NLP Barrier Detection System for Tender Documents
+RAG-based Barrier Detection System for Tender Documents
 
-This module implements a rule-based system using regex patterns to detect phrases in tender
-documents that create barriers for Small and Medium-sized Enterprises (SMEs).
+This module implements a RAG (Retrieval-Augmented Generation) system using:
+- Text similarity (Jaccard) for retrieving similar tender documents
+- Groq API for LLM-based barrier analysis
+
+Detects phrases in tender documents that create barriers for Small and Medium-sized Enterprises (SMEs).
 """
 
 import re
-from typing import List, Dict, Tuple
+import json
+import os
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
+from pathlib import Path
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load .env file from project root
+    project_root = Path(__file__).parent.parent.parent
+    env_path = project_root / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+    else:
+        # Try loading from current directory as fallback
+        load_dotenv()
+except ImportError:
+    # python-dotenv not installed, skip loading .env file
+    pass
+
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    Groq = None
 
 
 @dataclass
@@ -20,381 +48,177 @@ class FlaggedPhrase:
 
 class BarrierDetector:
     """
-    Rule-based NLP system for detecting barrier phrases in tender documents.
+    RAG-based barrier detection system for tender documents.
     
-    Uses regex patterns for matching to identify phrases that create barriers for SMEs, 
-    such as excessive trading history requirements, disproportionate insurance requirements, etc.
+    Uses Groq API with text similarity for retrieval and LLM analysis.
     """
     
-    def __init__(self):
-        """Initialize the barrier detector with pattern rules."""
-        self.patterns = self._build_patterns()
-    
-    def _build_patterns(self) -> List[Dict]:
+    def __init__(
+        self,
+        groq_api_key: Optional[str] = None,
+        groq_model: str = "llama-3.1-8b-instant",
+        knowledge_base_path: Optional[str] = None
+    ):
         """
-        Build pattern rules for barrier detection using regex patterns.
-        
-        Returns:
-            List of pattern dictionaries with regex patterns, category, and scoring logic
-        """
-        patterns = []
-        
-        # 1. Excessive Trading History Requirements
-        # High barrier: >10 years (15 points), Medium: 5-10 years (10 points)
-        patterns.extend([
-            {
-                "pattern": r"minimum\s+(?:of\s+)?(\d+)\s+years?\s+uninterrupted\s+trading\s+history",
-                "category": "Trading History",
-                "score_func": lambda m: 15 if int(m.group(1)) >= 10 else (10 if int(m.group(1)) >= 5 else 5),
-            },
-            {
-                "pattern": r"(\d+)\+?\s+years?\s+uninterrupted\s+trading",
-                "category": "Trading History",
-                "score_func": lambda m: 15 if int(m.group(1)) >= 10 else (10 if int(m.group(1)) >= 5 else 5),
-            },
-            {
-                "pattern": r"minimum\s+(?:of\s+)?(\d+)\s+years?\s+continuous\s+operation",
-                "category": "Trading History",
-                "score_func": lambda m: 15 if int(m.group(1)) >= 10 else (10 if int(m.group(1)) >= 5 else 5),
-            },
-            {
-                "pattern": r"must\s+demonstrate\s+continuous\s+operation\s+since",
-                "category": "Trading History",
-                "score": 12,
-            },
-            {
-                "pattern": r"evidence\s+of\s+trading\s+for\s+minimum\s+(\d+)\s+years?\s+required",
-                "category": "Trading History",
-                "score_func": lambda m: 15 if int(m.group(1)) >= 10 else (10 if int(m.group(1)) >= 5 else 5),
-            },
-            {
-                "pattern": r"established\s+business\s+with\s+(\d+)\+?\s+years?\s+track\s+record",
-                "category": "Trading History",
-                "score_func": lambda m: 15 if int(m.group(1)) >= 10 else (10 if int(m.group(1)) >= 5 else 5),
-            },
-        ])
-        
-        # 2. Disproportionate Insurance Requirements
-        # High barrier: >£20M (15 points), Medium: £10-20M (12 points), Low: <£10M (8 points)
-        # Public Liability >£15M is high barrier (12 points)
-        patterns.extend([
-            {
-                "pattern": r"professional\s+indemnity\s+insurance\s+(?:of\s+)?£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)",
-                "category": "Insurance",
-                "score_func": lambda m: 15 if float(m.group(1)) > 20 else (12 if float(m.group(1)) >= 10 else 8),
-            },
-            {
-                "pattern": r"public\s+liability\s+insurance\s+(?:of|exceeding)?\s*£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)",
-                "category": "Insurance",
-                "score_func": lambda m: 15 if float(m.group(1)) > 20 else (12 if float(m.group(1)) >= 15 else (8 if float(m.group(1)) >= 10 else 5)),
-            },
-            {
-                "pattern": r"liability\s+insurance\s+(?:of|exceeding)?\s*£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)",
-                "category": "Insurance",
-                "score_func": lambda m: 15 if float(m.group(1)) > 20 else (12 if float(m.group(1)) >= 10 else 8),
-            },
-            {
-                "pattern": r"£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)\s+liability\s+insurance",
-                "category": "Insurance",
-                "score_func": lambda m: 15 if float(m.group(1)) > 20 else (12 if float(m.group(1)) >= 10 else 8),
-            },
-            {
-                "pattern": r"multiple\s+insurance\s+policies?\s+each\s+exceeding\s+£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)",
-                "category": "Insurance",
-                "score_func": lambda m: 15 if float(m.group(1)) >= 10 else 12,
-            },
-            {
-                "pattern": r"employer['\s]?s\s+liability\s+insurance\s+(?:of|exceeding)?\s*£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)",
-                "category": "Insurance",
-                "score_func": lambda m: 12 if float(m.group(1)) > 15 else 8,
-            },
-            {
-                "pattern": r"insurance\s+requirements?:\s+£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)",
-                "category": "Insurance",
-                "score_func": lambda m: 15 if float(m.group(1)) > 20 else (12 if float(m.group(1)) >= 10 else 8),
-            },
-        ])
-        
-        # 3. Excessive Financial Thresholds
-        # High barrier: >£50M (15 points), Medium: £10-50M (12 points)
-        patterns.extend([
-            {
-                "pattern": r"minimum\s+(?:annual\s+)?turnover\s+(?:of\s+)?£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)\s+for\s+past\s+\d+\s+consecutive\s+years?",
-                "category": "Financial Thresholds",
-                "score_func": lambda m: 15 if float(m.group(1)) > 50 else (12 if float(m.group(1)) >= 10 else 8),
-            },
-            {
-                "pattern": r"minimum\s+(?:annual\s+)?turnover\s+(?:of\s+)?£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)",
-                "category": "Financial Thresholds",
-                "score_func": lambda m: 15 if float(m.group(1)) > 50 else (12 if float(m.group(1)) >= 10 else 8),
-            },
-            {
-                "pattern": r"turnover\s+exceeding\s+£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)",
-                "category": "Financial Thresholds",
-                "score_func": lambda m: 15 if float(m.group(1)) > 50 else (12 if float(m.group(1)) >= 10 else 8),
-            },
-            {
-                "pattern": r"audited\s+accounts?\s+demonstrating\s+turnover\s+exceeding\s+£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)",
-                "category": "Financial Thresholds",
-                "score_func": lambda m: 15 if float(m.group(1)) > 50 else (12 if float(m.group(1)) >= 10 else 8),
-            },
-            {
-                "pattern": r"minimum\s+£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)\s+annual\s+turnover",
-                "category": "Financial Thresholds",
-                "score_func": lambda m: 15 if float(m.group(1)) > 50 else (12 if float(m.group(1)) >= 10 else 8),
-            },
-            {
-                "pattern": r"financial\s+stability\s+with\s+minimum\s+£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)\s+revenue",
-                "category": "Financial Thresholds",
-                "score_func": lambda m: 15 if float(m.group(1)) > 50 else (12 if float(m.group(1)) >= 10 else 8),
-            },
-            {
-                "pattern": r"parent\s+company\s+guarantee\s+required",
-                "category": "Financial Thresholds",
-                "score": 10,
-            },
-        ])
-        
-        # 4. Unrealistic Time Constraints
-        # High barrier: Zero tolerance (12 points), 48 hours mobilization (12 points)
-        patterns.extend([
-            {
-                "pattern": r"completed\s+within\s+(\d+)\s+weeks?\s+(?:of\s+contract\s+award\s+)?with\s+zero\s+tolerance",
-                "category": "Time Constraints",
-                "score": 12,
-            },
-            {
-                "pattern": r"project\s+completion\s+in\s+(\d+)\s+weeks?\s+with\s+zero\s+tolerance\s+for\s+delays?",
-                "category": "Time Constraints",
-                "score": 12,
-            },
-            {
-                "pattern": r"no\s+extensions?\s+permitted\s+under\s+any\s+circumstances",
-                "category": "Time Constraints",
-                "score": 12,
-            },
-            {
-                "pattern": r"no\s+extensions?\s+permitted",
-                "category": "Time Constraints",
-                "score": 10,
-            },
-            {
-                "pattern": r"mobilization\s+required\s+within\s+(\d+)\s+hours?",
-                "category": "Time Constraints",
-                "score_func": lambda m: 12 if int(m.group(1)) <= 48 else 8,
-            },
-            {
-                "pattern": r"completion\s+deadline[:\s]+(\d+)\s+weeks?\s+with\s+zero\s+tolerance",
-                "category": "Time Constraints",
-                "score": 12,
-            },
-            {
-                "pattern": r"all\s+work\s+must\s+be\s+completed\s+within\s+(\d+)\s+weeks?",
-                "category": "Time Constraints",
-                "score_func": lambda m: 10 if int(m.group(1)) <= 8 else 6,
-            },
-        ])
-        
-        # 5. Excessive Certification Requirements
-        # High barrier: 3+ certifications (12 points), Medium: 1-2 certifications (8 points)
-        patterns.extend([
-            {
-                "pattern": r"(?:must\s+hold|required)\s+(?:ISO\s+\d+(?:,\s*)?){3,}",
-                "category": "Certifications",
-                "score": 12,
-            },
-            {
-                "pattern": r"ISO\s+\d+(?:,\s*ISO\s+\d+){2,}",
-                "category": "Certifications",
-                "score": 12,
-            },
-            {
-                "pattern": r"ISO\s+\d+(?:,\s*ISO\s+\d+){1,2}(?:,\s*[A-Za-z\s]+)?",
-                "category": "Certifications",
-                "score": 8,  # 1-2 certifications
-            },
-            {
-                "pattern": r"(\d+)\s+certifications?\s+(?:required|mandatory)",
-                "category": "Certifications",
-                "score_func": lambda m: 12 if int(m.group(1)) >= 3 else 8,
-            },
-            {
-                "pattern": r"must\s+hold\s+certification\s+from\s+[a-z\s]+body",
-                "category": "Certifications",
-                "score": 8,
-            },
-            {
-                "pattern": r"all\s+proposed\s+staff\s+must\s+have\s+[a-z\s]+qualification",
-                "category": "Certifications",
-                "score": 8,
-            },
-        ])
-        
-        # 6. Geographic or Infrastructure Requirements
-        patterns.extend([
-            {
-                "pattern": r"must\s+maintain\s+offices?\s+in\s+(?:[A-Z][a-z]+(?:,\s*)?){2,}",
-                "category": "Geographic Requirements",
-                "score": 10,
-            },
-            {
-                "pattern": r"must\s+own\s+equipment\s+valued\s+at\s+minimum\s+£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)",
-                "category": "Infrastructure",
-                "score_func": lambda m: 12 if float(m.group(1)) > 5 else 8,
-            },
-            {
-                "pattern": r"dedicated\s+site\s+office\s+with\s+minimum\s+(\d+)\s+full[- ]time\s+staff",
-                "category": "Infrastructure",
-                "score_func": lambda m: 10 if int(m.group(1)) >= 10 else 6,
-            },
-        ])
-        
-        # 7. Overly Specific Experience Requirements
-        patterns.extend([
-            {
-                "pattern": r"must\s+have\s+completed\s+contracts?\s+with\s+minimum\s+(\d+)\s+central\s+government\s+departments?",
-                "category": "Experience Requirements",
-                "score": 12,
-            },
-            {
-                "pattern": r"evidence\s+of\s+handling\s+cases?\s+exceeding\s+£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)\s+in\s+value",
-                "category": "Experience Requirements",
-                "score_func": lambda m: 12 if float(m.group(1)) >= 100 else (10 if float(m.group(1)) >= 50 else 8),
-            },
-            {
-                "pattern": r"cases?\s+exceeding\s+£?\s*(\d+(?:\.\d+)?)\s*(?:million|m)\s+in\s+value",
-                "category": "Experience Requirements",
-                "score_func": lambda m: 12 if float(m.group(1)) >= 100 else (10 if float(m.group(1)) >= 50 else 8),
-            },
-            {
-                "pattern": r"portfolio\s+must\s+demonstrate\s+projects?\s+for\s+fortune\s+500\s+clients?",
-                "category": "Experience Requirements",
-                "score": 12,
-            },
-            {
-                "pattern": r"fortune\s+500\s+clients?",
-                "category": "Experience Requirements",
-                "score": 10,
-            },
-            {
-                "pattern": r"previous\s+experience\s+with\s+[a-z\s]+(?:mandatory|required)",
-                "category": "Experience Requirements",
-                "score": 10,
-            },
-            {
-                "pattern": r"top\s+(\d+)\s+(?:law\s+firm|consultancy\s+firm|global\s+consultancy)",
-                "category": "Experience Requirements",
-                "score": 12,
-            },
-        ])
-        
-        # 8. Excessive Resource Requirements
-        patterns.extend([
-            {
-                "pattern": r"must\s+employ\s+at\s+least\s+(\d+)\s+full[- ]time",
-                "category": "Resource Requirements",
-                "score_func": lambda m: 12 if int(m.group(1)) >= 50 else (8 if int(m.group(1)) >= 20 else 5),
-            },
-            {
-                "pattern": r"minimum\s+team\s+of\s+(\d+)\s+senior\s+consultants?",
-                "category": "Resource Requirements",
-                "score_func": lambda m: 10 if int(m.group(1)) >= 8 else 6,
-            },
-            {
-                "pattern": r"minimum\s+(\d+)\s+years?\s+experience\s+(?:each|required)",
-                "category": "Resource Requirements",
-                "score_func": lambda m: 10 if int(m.group(1)) >= 10 else 6,
-            },
-            {
-                "pattern": r"mobilize\s+(\d+)\+\s+workers?",
-                "category": "Resource Requirements",
-                "score_func": lambda m: 12 if int(m.group(1)) >= 50 else 8,
-            },
-        ])
-        
-        # 9. Disproportionate Penalty Clauses
-        # High barrier: £50K/week (12 points), Performance bond 15-20% (12 points)
-        patterns.extend([
-            {
-                "pattern": r"liquidated\s+damages[:\s]+£?\s*(\d+(?:,\d+)?)\s+per\s+week",
-                "category": "Penalty Clauses",
-                "score_func": lambda m: 12 if int(m.group(1).replace(',', '')) >= 50000 else 8,
-            },
-            {
-                "pattern": r"performance\s+bond\s+of\s+(\d+)[-–]?(\d+)?%",
-                "category": "Penalty Clauses",
-                "score_func": lambda m: 12 if int(m.group(1)) >= 15 else 8,
-            },
-            {
-                "pattern": r"performance\s+bond\s+of\s+(\d+)%",
-                "category": "Penalty Clauses",
-                "score_func": lambda m: 12 if int(m.group(1)) >= 15 else 8,
-            },
-            {
-                "pattern": r"penalty\s+clauses?\s+with\s+zero\s+tolerance",
-                "category": "Penalty Clauses",
-                "score": 12,
-            },
-            {
-                "pattern": r"penalties?\s+for\s+delays?",
-                "category": "Penalty Clauses",
-                "score": 6,
-            },
-        ])
-        
-        # 10. Sole Source or Proprietary Specifications
-        patterns.extend([
-            {
-                "pattern": r"must\s+use\s+materials?\s+from\s+[a-z\s]+manufacturer\s+only",
-                "category": "Proprietary Specifications",
-                "score": 10,
-            },
-            {
-                "pattern": r"sole\s+source\s+specifications?",
-                "category": "Proprietary Specifications",
-                "score": 10,
-            },
-            {
-                "pattern": r"compliance\s+with\s+proprietary\s+frameworks?\s+mandatory",
-                "category": "Proprietary Specifications",
-                "score": 10,
-            },
-            {
-                "pattern": r"proprietary\s+frameworks?\s+mandatory",
-                "category": "Proprietary Specifications",
-                "score": 10,
-            },
-            {
-                "pattern": r"must\s+use\s+[a-z\s]+(?:software|system)\s+exclusively",
-                "category": "Proprietary Specifications",
-                "score": 10,
-            },
-            {
-                "pattern": r"specific\s+manufacturer\s+requirements?",
-                "category": "Proprietary Specifications",
-                "score": 8,
-            },
-        ])
-        
-        return patterns
-    
-    def _preprocess_text(self, text: str) -> str:
-        """
-        Preprocess text for better pattern matching.
+        Initialize the barrier detector.
         
         Args:
-            text: Raw text to preprocess
+            groq_api_key: Groq API key (required, can also be set via GROQ_API_KEY env var)
+            groq_model: Groq model to use (default: llama-3.1-8b-instant)
+            knowledge_base_path: Path to JSON file with tender documents
+        """
+        if not GROQ_AVAILABLE:
+            raise ImportError("groq package not installed. Install with: pip install groq")
+        
+        api_key = groq_api_key or os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "Groq API key required. Set GROQ_API_KEY env var or pass groq_api_key parameter"
+            )
+        
+        self.groq_client = Groq(api_key=api_key)
+        self.groq_model = groq_model
+        
+        # Load knowledge base
+        if knowledge_base_path is None:
+            project_root = Path(__file__).parent.parent.parent
+            knowledge_base_path = project_root / "data" / "sample_tender_documents.json"
+        
+        self.knowledge_base = self._load_knowledge_base(knowledge_base_path)
+        print(f"RAG-based barrier detector initialized. Loaded {len(self.knowledge_base)} tender documents.")
+    
+    def _load_knowledge_base(self, path: str) -> List[Dict]:
+        """Load tender documents from JSON file."""
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Knowledge base file not found: {path}")
+        
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        if not isinstance(data, list):
+            raise ValueError("Knowledge base must be a JSON array")
+        
+        return data
+    
+    def _simple_text_similarity(self, text1: str, text2: str) -> float:
+        """
+        Calculate simple text similarity using word overlap (Jaccard similarity).
+        No external dependencies needed.
+        """
+        # Normalize and tokenize
+        words1 = set(re.findall(r'\b\w+\b', text1.lower()))
+        words2 = set(re.findall(r'\b\w+\b', text2.lower()))
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        # Jaccard similarity
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def _retrieve_similar_documents(self, query_text: str, top_k: int = 5) -> List[Dict]:
+        """
+        Retrieve top-k most similar tender documents using simple text similarity.
+        
+        Args:
+            query_text: Input tender text
+            top_k: Number of similar documents to retrieve
             
         Returns:
-            Preprocessed text with normalized whitespace
+            List of similar tender documents with similarity scores
         """
-        # Normalize whitespace
-        text = re.sub(r'\s+', ' ', text)
-        return text
+        similarities = []
+        for doc in self.knowledge_base:
+            doc_text = doc.get("text", "")
+            similarity = self._simple_text_similarity(query_text, doc_text)
+            similarities.append((similarity, doc))
+        
+        # Sort by similarity and get top-k
+        similarities.sort(reverse=True, key=lambda x: x[0])
+        top_docs = []
+        for similarity, doc in similarities[:top_k]:
+            doc_copy = doc.copy()
+            doc_copy['similarity_score'] = similarity
+            top_docs.append(doc_copy)
+        
+        return top_docs
+    
+    def _create_rag_prompt(self, tender_text: str, similar_documents: List[Dict]) -> str:
+        """Create prompt for Groq LLM analysis."""
+        context_examples = ""
+        for i, doc in enumerate(similar_documents, 1):
+            context_examples += f"\nExample {i} (Similarity: {doc['similarity_score']:.3f}):\n"
+            context_examples += f"Title: {doc.get('title', 'N/A')}\n"
+            context_examples += f"Text: {doc.get('text', '')[:400]}...\n"
+        
+        prompt = f"""You are an expert in analyzing public procurement tender documents to identify barriers that exclude Small and Medium-sized Enterprises (SMEs).
+
+Your task is to analyze the following tender document and identify:
+1. Barrier phrases that may exclude SMEs
+2. Categories of barriers (Trading History, Insurance, Financial Thresholds, Time Constraints, Certifications, Geographic Requirements, Experience Requirements, Resource Requirements, Penalty Clauses, Proprietary Specifications)
+3. Barrier scores (0-15 points per phrase, based on severity)
+4. Total barrier score (0-100, sum of all phrase scores, capped at 100)
+5. Recommendation based on total score
+
+Barrier Scoring Guidelines:
+- Trading History: 10+ years = 15 points, 5-10 years = 10 points
+- Insurance: >£20M = 15 points, £10-20M = 12 points, <£10M = 8 points
+- Financial Thresholds: >£50M = 15 points, £10-50M = 12 points
+- Time Constraints: Zero tolerance = 12 points, tight deadlines = 6-10 points
+- Certifications: 3+ certifications = 12 points, 1-2 = 8 points
+- Other barriers: 8-12 points depending on severity
+
+Similar Tender Examples for Context:
+{context_examples}
+
+Tender Document to Analyze:
+{tender_text}
+
+Please analyze this tender document and provide a JSON response with the following structure:
+{{
+    "barrier_score": <integer 0-100>,
+    "flagged_phrases": [
+        {{
+            "phrase": "<exact phrase from text>",
+            "category": "<category name>",
+            "score": <integer 0-15>
+        }}
+    ],
+    "recommendation": "<recommendation text based on score>"
+}}
+
+Recommendation Guidelines:
+- 0-25: "Low barrier risk - tender appears SME-friendly"
+- 26-50: "Medium barrier risk - consider reviewing requirements"
+- 51-75: "High barrier risk - recommend review for SME accessibility"
+- 76-100: "Very high barrier risk - strongly recommend review and revision"
+
+Return ONLY valid JSON, no additional text or explanation."""
+        
+        return prompt
+    
+    def _call_groq(self, prompt: str) -> str:
+        """Call Groq API for LLM analysis."""
+        try:
+            response = self.groq_client.chat.completions.create(
+                model=self.groq_model,
+                messages=[
+                    {"role": "system", "content": "You are an expert in procurement barrier analysis. Always respond with valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            raise RuntimeError(f"Groq API error: {str(e)}")
     
     def detect_barriers(self, text: str) -> Tuple[List[FlaggedPhrase], int]:
         """
-        Detect barrier phrases in tender text using regex patterns.
+        Detect barrier phrases in tender text using RAG with Groq API.
         
         Args:
             text: The tender document text to analyze
@@ -405,42 +229,39 @@ class BarrierDetector:
         if not text or not text.strip():
             return [], 0
         
-        # Preprocess text (normalize whitespace)
-        processed_text = self._preprocess_text(text)
+        # Retrieve similar documents
+        similar_docs = self._retrieve_similar_documents(text, top_k=5)
         
-        flagged_phrases = []
-        seen_phrases = set()  # Avoid duplicate detections
+        # Create analysis prompt
+        prompt = self._create_rag_prompt(text, similar_docs)
         
-        for pattern_dict in self.patterns:
-            regex = re.compile(pattern_dict["pattern"], re.IGNORECASE | re.MULTILINE)
-            
-            for match in regex.finditer(processed_text):
-                phrase = match.group(0)
-                # Avoid counting the same phrase multiple times
-                phrase_key = (phrase.lower(), match.start(), match.end())
-                if phrase_key in seen_phrases:
-                    continue
-                seen_phrases.add(phrase_key)
-                
-                # Calculate score
-                if "score_func" in pattern_dict:
-                    try:
-                        score = pattern_dict["score_func"](match)
-                    except (ValueError, IndexError):
-                        score = pattern_dict.get("score", 5)
-                else:
-                    score = pattern_dict.get("score", 5)
-                
-                flagged_phrases.append(FlaggedPhrase(
-                    phrase=phrase,
-                    category=pattern_dict["category"],
-                    score=score
-                ))
+        # Call Groq API
+        llm_response = self._call_groq(prompt)
         
-        # Calculate total barrier score (capped at 100)
-        total_score = min(sum(fp.score for fp in flagged_phrases), 100)
+        # Parse response
+        try:
+            result = json.loads(llm_response)
+        except json.JSONDecodeError:
+            # Try to extract JSON from response if wrapped in text
+            json_match = re.search(r'\{.*\}', llm_response, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+            else:
+                raise ValueError(f"Failed to parse Groq response as JSON: {llm_response}")
         
-        return flagged_phrases, total_score
+        # Convert to FlaggedPhrase objects
+        flagged_phrases = [
+            FlaggedPhrase(
+                phrase=fp["phrase"],
+                category=fp["category"],
+                score=fp["score"]
+            )
+            for fp in result.get("flagged_phrases", [])
+        ]
+        
+        barrier_score = result.get("barrier_score", 0)
+        
+        return flagged_phrases, barrier_score
     
     def get_recommendation(self, score: int) -> str:
         """
